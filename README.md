@@ -1,6 +1,6 @@
 # 本地字幕切分 API（Python + FastAPI）
 
-接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。另提供**视频删段重排**接口：给定原视频上的删除区间，丢弃被完整覆盖的词、将保留词按累计删除时长前移，再对各连续片段分别优化切分。
+接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。另提供**视频删段重排**接口：给定原视频上的删除区间，丢弃被完整覆盖的词、将保留词按累计删除时长前移，再对各连续片段分别优化切分；以及**遮挡感知的位置决策**接口：给定视频时间轴上的遮挡区间（`top` / `bottom` 区域），联合优化分条与字幕摆放位置（相邻字幕换区加 1 分），并导出带 cue 行位置的 WebVTT。
 
 - 优化目标（总代价）：
 
@@ -347,6 +347,110 @@ Hello world.
 Fine thanks.
 ```
 
+### `POST /segment/place` —— 遮挡感知的位置决策（JSON）
+
+在 `/segment` 的基础上接收**视频时间轴上的遮挡区间**（每个区间遮挡 `top` 或 `bottom` 一个区域），联合决定字幕的**分条**与**摆放位置**：
+
+- **遮挡规则**：字幕时段 `[start_ms, end_ms]` 与某遮挡区间有**正长度交集**时，该区间遮挡的区域对这条字幕不可用（端点恰好相接不算相交）；每条字幕必须有一个在其整个时段内都可用的区域，任何词无法被满足该条件的字幕覆盖时整体无解，返回 `422`；
+- **联合优化**：分条沿用 `/segment` 的字数、时长、双行排版与自然边界规则及代价；此外每对相邻字幕若分处不同区域，总代价 **+1**（换区罚分）；
+- **平局规则**：总代价相同先比字幕条数（少者胜），再逐条比较位置序列，`bottom` 优先于 `top`——因此没有遮挡时全部字幕都在 `bottom`；
+- **遮挡区间**：数组元素为 `{start_ms, end_ms, region}`，`region ∈ {top, bottom}`，`start_ms < end_ms` 且均 ≥ 0；区间**无需排序、允许重叠**（同一时刻两个区域都被遮挡时，跨过该时刻的字幕将无区域可用）；不传或传空数组等价于无遮挡。
+
+请求体在 `/segment` 字段（`words`、`max_chars`、`min_duration_ms`、`max_duration_ms`、`target_duration_ms`、`pause_threshold_ms`、可选 `max_line_chars`）之上增加：
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `occlusions` | 对象数组 | `[]` | 遮挡区间：`start_ms` / `end_ms` 为视频时间轴毫秒（≥ 0，`start_ms < end_ms`），`region` 为 `top` 或 `bottom` |
+
+> 该接口不接受 `required_break_after` / `keep_together`。
+
+请求示例（原视频 1.8s–4.8s 底部区域被遮挡）：
+
+```bash
+curl -X POST http://localhost:8000/segment/place \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_place.json
+```
+
+响应示例（`200`）：
+
+```json
+{
+  "segment_count": 3,
+  "total_cost": 5.96,
+  "segments": [
+    {
+      "index": 0,
+      "text": "Hello world.",
+      "start_ms": 0,
+      "end_ms": 1400,
+      "duration_ms": 1400,
+      "word_start": 0,
+      "word_end": 1,
+      "crossed_boundaries": 0,
+      "position": "top"
+    },
+    {
+      "index": 1,
+      "text": "How are you doing today?",
+      "start_ms": 2000,
+      "end_ms": 4600,
+      "duration_ms": 2600,
+      "word_start": 2,
+      "word_end": 6,
+      "crossed_boundaries": 0,
+      "position": "top"
+    },
+    {
+      "index": 2,
+      "text": "Fine thanks.",
+      "start_ms": 5200,
+      "end_ms": 6400,
+      "duration_ms": 1200,
+      "word_start": 7,
+      "word_end": 8,
+      "crossed_boundaries": 0,
+      "position": "top"
+    }
+  ]
+}
+```
+
+每条字幕比 `/segment` 的响应多一个 `position` 字段（`top` / `bottom`）。注意中间字幕（2000–4600 ms）与底部遮挡相交、只能放顶部；若只把它移到顶部会产生 2 次换区（+2 分），因此三条字幕整体放在顶部（5.96 + 0 换区罚分）反而总代价最低——这正是“分条与位置联合优化”的效果。
+
+### `POST /segment/place/vtt` —— 位置决策的 WebVTT 导出
+
+请求体与 `/segment/place` 完全相同，返回同一份切分与位置结果的 WebVTT 文档（`text/vtt; charset=utf-8`），位置用 **cue 行位置**（`line` 设置）呈现：`top` → `line:0%`，`bottom` → `line:100%`：
+
+```bash
+curl -X POST http://localhost:8000/segment/place/vtt \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_place.json
+```
+
+```vtt
+WEBVTT
+
+00:00:00.000 --> 00:00:01.400 line:0%
+Hello world.
+
+00:00:02.000 --> 00:00:04.600 line:0%
+How are you doing today?
+
+00:00:05.200 --> 00:00:06.400 line:0%
+Fine thanks.
+```
+
+保存到文件：
+
+```bash
+curl -X POST http://localhost:8000/segment/place/vtt \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_place.json -o subtitles.vtt
+```
+
+传入 `max_line_chars` 时，双行字幕在 cue 文本内用真实换行输出两行。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`（容器健康检查同样使用该端点）。
@@ -372,6 +476,13 @@ Fine thanks.
   - 某个词与删除边界相交但未被完整覆盖（删除边界切穿了词）；
   - 删除区间覆盖了全部词，没有任何词可排；
   - 某个连续保留片段在现有字数 / 时长 / 行宽限制下无合法切分（错误信息注明片段序号）；
+- **遮挡区间相关（`/segment/place`、`/segment/place/vtt`）**：
+  - 遮挡区间 `start_ms >= end_ms`、`region` 不是 `top` / `bottom`、毫秒为负数或字段缺失；
+  - 某条字幕的整个时段内两个区域都被遮挡（任何切分都无法给每条字幕一个全程可用区域）——会返回类似：
+
+    ```json
+    {"detail": "no legal segmentation gives every subtitle an available region under the given constraints (max_chars=42, min_duration_ms=1000, max_duration_ms=7000); every subtitle — including the last one — must satisfy the duration limits and keep one region (top or bottom) free of occlusions for its whole time span, so try relaxing min_duration_ms or the other limits, or narrowing the occlusion intervals"}
+    ```
 - 没有任何切分能满足全部约束（例如最后一个词短于 `min_duration_ms`，或**人工边界迫使某条字幕违反时长 / 字数 / 行宽约束**，或传入 `max_line_chars` 后不存在满足行宽的双行排版）——会返回类似：
 
   ```json
@@ -392,7 +503,7 @@ Fine thanks.
 | `DEFAULT_TARGET_DURATION_MS` | `3000` | `target_duration_ms` |
 | `DEFAULT_PAUSE_THRESHOLD_MS` | `500` | `pause_threshold_ms` |
 
-`max_line_chars` 没有环境变量默认值：省略该请求字段即不启用双行排版，行为与旧版完全一致。`required_break_after`、`keep_together` 同样没有环境变量默认值：省略即不施加任何人工边界。`deletions` 为 `/segment/cut` 的必填字段，也没有环境变量默认值。
+`max_line_chars` 没有环境变量默认值：省略该请求字段即不启用双行排版，行为与旧版完全一致。`required_break_after`、`keep_together` 同样没有环境变量默认值：省略即不施加任何人工边界。`deletions` 为 `/segment/cut` 的必填字段，也没有环境变量默认值。`occlusions` 为 `/segment/place` 的可选字段（默认空数组，等价于无遮挡），没有环境变量默认值；换区罚分固定为 1 分（`REGION_SWITCH_PENALTY`），不通过环境变量配置。
 
 不需要外部数据库或密钥，开箱即用。
 
@@ -425,10 +536,12 @@ app/
   models.py      # Pydantic 请求/响应模型
   segmenter.py   # 动态规划切分核心（纯 Python，无 Web 依赖）
   cut.py         # 视频删段后的重排：删词、时间前移、分片段切分
+  place.py       # 遮挡感知的位置决策：分条与 top/bottom 放置联合优化
   srt.py         # SRT 时间戳与文档格式化
-  main.py        # FastAPI 入口（/segment、/segment/srt、/segment/cut、/segment/cut/srt、/health）
-tests/           # unittest 测试（核心逻辑 + 删段重排 + API 集成）
-examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界 / 删段重排）
+  vtt.py         # WebVTT 时间戳与带 cue 行位置的文档格式化
+  main.py        # FastAPI 入口（/segment、/segment/srt、/segment/cut、/segment/cut/srt、/segment/place、/segment/place/vtt、/health）
+tests/           # unittest 测试（核心逻辑 + 删段重排 + 遮挡放置 + API 集成）
+examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界 / 删段重排 / 遮挡放置）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -457,3 +570,5 @@ dp[i] = 按 (总代价, 字幕条数) 字典序取最小，枚举合法的字幕
 传入 `max_line_chars` 时，`linecost(i,j)` 为该候选字幕的排版代价：整段不超行宽则为 0（单行）；否则在词间枚举断点，两行各自不超行宽时计算 `(行长1 − 行长2)² / 行宽²`，取最小值（平局取靠前断点）；没有合法断点时该候选非法。行长用“词长 + 词间空格”的前缀和按二分搜索求值，合法断点范围与等长断点都只需 O(log n) 定位，因此整体时间复杂度仍为 O(n² log n)（不传该参数时为 O(n²)），空间 O(n)。
 
 删段重排在进入 DP 之前做一次线性扫描：删除区间先校验升序、不重叠、`start < end`；随后按时间顺序遍历词，用指针推进区间——完整落入区间的词丢弃，与边界相交但未完整覆盖的词直接报错，保留词减去此前累计删除时长；凡是跨过删除区间的位置都开启新的连续片段。由于每个删除区间强制成为字幕边缘，总代价与硬约束都按字幕可加，因此各片段独立跑一次上述 DP 即等价于全局强制断点后的最优解；各片段的字幕顺序拼接、统一编号，`word_start` / `word_end` 映射回原请求下标。
+
+遮挡放置把 DP 状态扩展为 **(词下标, 区域)**：`dp[i][r]` 表示“从第 `i` 个词切到结尾、且第 `i` 个词所在字幕放在区域 `r`”的最优 `(总代价, 字幕条数, 位置序列)`。候选字幕 `i..j` 先按原有的字数 / 时长 / 行宽规则过滤，再要求区域 `r` 在整个时段 `[start_i, end_j]` 上无遮挡——遮挡区间按区域分别排序后用“起点二分 + 终点前缀最大值”做 O(log n) 查询，端点相接不算相交；转移时枚举下一条字幕的区域 `r'`，`r' ≠ r` 时加 1 分换区罚分。同一状态内所有候选的位置序列都以 `r` 开头，因此序列比较可直接落在后继状态的序列元组上（每个状态只在扫描结束后拼接一次序列）；平局依次比较 `(总代价, 字幕条数, 位置序列)`，位置序列中 `bottom` 排在 `top` 前。最终答案在 `dp[0][bottom]` 与 `dp[0][top]` 之间按同一规则取舍，时间复杂度 O(n² log n)。由于换区罚分只依赖相邻字幕的区域，该状态设计保留了最优子结构，求出的仍是满足全部硬约束的**全局**最低代价方案。

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -119,6 +119,42 @@ class CutRequest(BaseSegmentRequest):
     )
 
 
+# Frame region a subtitle can occupy / an occlusion can block.
+Region = Literal["top", "bottom"]
+
+
+class Occlusion(BaseModel):
+    start_ms: int = Field(
+        ge=0, description="occlusion start on the video timeline in milliseconds"
+    )
+    end_ms: int = Field(
+        gt=0, description="occlusion end on the video timeline in milliseconds"
+    )
+    region: Region = Field(
+        description="frame region blocked by the occlusion: top or bottom"
+    )
+
+    @model_validator(mode="after")
+    def _check_times(self) -> "Occlusion":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms must be greater than start_ms")
+        return self
+
+
+class PlaceRequest(BaseSegmentRequest):
+    occlusions: list[Occlusion] = Field(
+        default_factory=list,
+        description=(
+            "occlusion intervals on the video timeline; while a subtitle's "
+            "time span intersects an occlusion with positive length, the "
+            "occluded region is unavailable for that subtitle, and every "
+            "subtitle must keep one region available for its whole duration. "
+            "Intervals may be given in any order and may overlap; an empty "
+            "array means no occlusion at all"
+        ),
+    )
+
+
 class SegmentOut(BaseModel):
     index: int
     text: str
@@ -134,3 +170,13 @@ class SegmentResponse(BaseModel):
     segment_count: int
     total_cost: float
     segments: list[SegmentOut]
+
+
+class PlaceSegmentOut(SegmentOut):
+    position: Region
+
+
+class PlaceResponse(BaseModel):
+    segment_count: int
+    total_cost: float
+    segments: list[PlaceSegmentOut]
