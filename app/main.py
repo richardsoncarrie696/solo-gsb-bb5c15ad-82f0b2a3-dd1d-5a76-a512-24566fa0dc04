@@ -7,9 +7,19 @@ from fastapi.responses import PlainTextResponse
 
 from . import config
 from .cut import segment_with_deletions
-from .models import CutRequest, SegmentOut, SegmentRequest, SegmentResponse
+from .models import (
+    CutRequest,
+    PlaceRequest,
+    PlaceResponse,
+    PlacedSegmentOut,
+    SegmentOut,
+    SegmentRequest,
+    SegmentResponse,
+)
+from .place import segment_and_place
 from .segmenter import SegmentationError, SegmentationResult, segment_words
 from .srt import to_srt
+from .vtt import to_vtt
 
 app = FastAPI(
     title="Subtitle Segmenter",
@@ -27,7 +37,13 @@ app = FastAPI(
         "respect. The /segment/cut endpoints additionally accept deletion "
         "intervals on the original video timeline: covered words are dropped, "
         "the survivors are shifted earlier by the deleted duration, and every "
-        "continuous fragment is re-optimised separately."
+        "continuous fragment is re-optimised separately. The /segment/place "
+        "endpoints additionally accept timeline occlusions tagged with a "
+        "screen area (top/bottom): segmentation and per-subtitle vertical "
+        "placement are decided jointly, with a 1-point cost for every pair of "
+        "adjacent subtitles placed in different areas, ties broken by fewer "
+        "subtitles and then by the area sequence (bottom preferred); every "
+        "subtitle must keep one area fully clear for its whole duration."
     ),
 )
 
@@ -47,6 +63,8 @@ def root() -> dict:
             "segment_srt": "POST /segment/srt",
             "segment_cut_json": "POST /segment/cut",
             "segment_cut_srt": "POST /segment/cut/srt",
+            "segment_place_json": "POST /segment/place",
+            "segment_place_vtt": "POST /segment/place/vtt",
             "health": "GET /health",
         },
         "defaults": {
@@ -138,3 +156,49 @@ def segment_cut_srt(req: CutRequest) -> PlainTextResponse:
     """Same re-segmentation as /segment/cut, exported as an SRT document."""
     result = _run_cut(req)
     return PlainTextResponse(to_srt(result.segments))
+
+
+def _run_place(req: PlaceRequest):
+    try:
+        return segment_and_place(
+            req.words,
+            [(o.start_ms, o.end_ms, o.region) for o in req.occlusions],
+            max_chars=req.max_chars,
+            min_duration_ms=req.min_duration_ms,
+            max_duration_ms=req.max_duration_ms,
+            target_duration_ms=req.target_duration_ms,
+            pause_threshold_ms=req.pause_threshold_ms,
+            max_line_chars=req.max_line_chars,
+            required_break_after=req.required_break_after,
+            keep_together=req.keep_together,
+        )
+    except SegmentationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/segment/place", response_model=PlaceResponse, tags=["segment"])
+def segment_place(req: PlaceRequest) -> PlaceResponse:
+    """Segment and place each subtitle in a clear top/bottom area (JSON)."""
+    result = _run_place(req)
+    return PlaceResponse(
+        segment_count=len(result.segments),
+        total_cost=round(result.total_cost, 6),
+        segments=[PlacedSegmentOut(**vars(seg)) for seg in result.segments],
+    )
+
+
+@app.post(
+    "/segment/place/vtt",
+    response_class=PlainTextResponse,
+    tags=["segment"],
+)
+def segment_place_vtt(req: PlaceRequest) -> PlainTextResponse:
+    """Same joint segmentation/placement as /segment/place, as WebVTT.
+
+    The chosen area is rendered on each cue with a WebVTT line setting
+    (``line:0`` for top, ``line:-1`` for bottom).
+    """
+    result = _run_place(req)
+    return PlainTextResponse(
+        to_vtt(result.segments), media_type="text/vtt; charset=utf-8"
+    )

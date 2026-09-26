@@ -268,7 +268,51 @@ def _best_layout(
     return best_m, (best_diff**2) / width**2
 
 
-def segment_words(
+@dataclass(frozen=True)
+class PreparedSegmentation:
+    """Validated transcript plus the precomputed tables shared by the DP runs.
+
+    Built once by :func:`prepare_segmentation`; both the plain optimiser and
+    the placement-aware optimiser (``place`` module) enumerate candidates
+    over the same prepared tables so their character, duration and two-line
+    rules never drift apart.
+    """
+
+    words: Sequence[WordLike]
+    max_chars: int
+    min_duration_ms: int
+    max_duration_ms: int
+    target_s: float
+    max_line_chars: int | None
+    nat_prefix: Sequence[int]
+    cum_len: Sequence[int]
+    space_before: Sequence[int]
+    required_prefix: Sequence[int]
+    blocked_edge: Sequence[bool]
+    has_manual_edits: bool
+
+
+@dataclass(frozen=True)
+class SegmentCandidate:
+    """A legal subtitle spanning the words ``i..j``.
+
+    ``base_cost`` is the candidate's own segmentation cost (duration
+    deviation, crossed natural boundaries, two-line layout) excluding any
+    placement-area terms; ``break_word`` is the first word of the second
+    line (``-1`` when the text fits on one line).
+    """
+
+    i: int
+    j: int
+    start_ms: int
+    end_ms: int
+    duration_ms: int
+    crossed: int
+    break_word: int
+    base_cost: float
+
+
+def prepare_segmentation(
     words: Sequence[WordLike],
     *,
     max_chars: int,
@@ -279,7 +323,13 @@ def segment_words(
     max_line_chars: int | None = None,
     required_break_after: Sequence[int] | None = None,
     keep_together: Sequence[Sequence[int]] | None = None,
-) -> SegmentationResult:
+) -> PreparedSegmentation:
+    """Validate the request and build the shared prefix tables.
+
+    Mirrors every input check of :func:`segment_words`; raises
+    :class:`SegmentationError` (HTTP 422) on any illegal word, ordering or
+    human-edited boundary.
+    """
     n = len(words)
     if n == 0:
         raise SegmentationError("words must contain at least one word")
@@ -363,6 +413,135 @@ def segment_words(
     for k in range(n):
         cum_len[k + 1] = cum_len[k] + len(words[k].text) + space_before[k]
 
+    return PreparedSegmentation(
+        words=words,
+        max_chars=max_chars,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+        target_s=target_duration_ms / 1000.0,
+        max_line_chars=max_line_chars,
+        nat_prefix=nat_prefix,
+        cum_len=cum_len,
+        space_before=space_before,
+        required_prefix=required_prefix,
+        blocked_edge=blocked_edge,
+        has_manual_edits=bool(required_breaks or keep_ranges),
+    )
+
+
+def iter_candidates(
+    prep: PreparedSegmentation,
+    i: int,
+):
+    """Yield every legal subtitle candidate starting at word ``i``.
+
+    Enumerates end positions ``j >= i`` and applies the hard constraints
+    shared by all optimisers: character limit, duration limit, mandatory
+    breaks, keep-together edges and two-line layout.  Spans shorter than
+    ``min_duration_ms`` are skipped.  Reachability of the suffix (and any
+    placement-area constraint) is the caller's concern and intentionally
+    not checked here.  The ``break`` / ``continue`` pruning mirrors the
+    original single DP: character and duration overflow, a swallowed
+    mandatory break and an unlayoutable span are monotone in ``j`` (break),
+    while a blocked end edge or a too-short span is a local skip
+    (continue).
+    """
+    words = prep.words
+    n = len(words)
+    chars = 0
+    for j in range(i, n):
+        chars += len(words[j].text) + (
+            prep.space_before[j] if j > i else 0
+        )
+        if chars > prep.max_chars:
+            break  # only grows as j grows
+        dur_ms = words[j].end_ms - words[i].start_ms
+        if dur_ms > prep.max_duration_ms:
+            break  # only grows as j grows
+        # A mandatory break inside the segment is illegal, and once the
+        # span has swallowed one, every wider span starting at i does too.
+        if prep.required_prefix[j] - prep.required_prefix[i] > 0:
+            break
+        # The segment's end edge sits between words j and j+1; a
+        # keep-together interval forbids edges strictly inside itself.
+        if prep.blocked_edge[j + 1]:
+            continue
+        if prep.max_line_chars is not None:
+            layout = _best_layout(
+                i,
+                j,
+                prep.cum_len,
+                prep.space_before,
+                prep.max_line_chars,
+            )
+            if layout is None:
+                break  # wider spans starting at i stay unlayoutable
+            break_word, line_cost = layout
+        else:
+            break_word, line_cost = -1, 0.0
+        if dur_ms < prep.min_duration_ms:
+            continue
+        crossed = prep.nat_prefix[j] - prep.nat_prefix[i]
+        dur_s = dur_ms / 1000.0
+        base_cost = (
+            (dur_s - prep.target_s) ** 2
+            + CROSSED_BOUNDARY_PENALTY * crossed
+            + line_cost
+        )
+        yield SegmentCandidate(
+            i=i,
+            j=j,
+            start_ms=words[i].start_ms,
+            end_ms=words[j].end_ms,
+            duration_ms=dur_ms,
+            crossed=crossed,
+            break_word=break_word,
+            base_cost=base_cost,
+        )
+
+
+def build_segment_text(
+    words: Sequence[WordLike],
+    i: int,
+    j: int,
+    break_word: int,
+) -> str:
+    """Join words ``i..j`` into one or two lines (``break_word`` = -1 → 1)."""
+    texts = [w.text for w in words[i : j + 1]]
+    if break_word > 0:
+        return (
+            join_word_texts(texts[: break_word - i])
+            + "\n"
+            + join_word_texts(texts[break_word - i :])
+        )
+    return join_word_texts(texts)
+
+
+def segment_words(
+    words: Sequence[WordLike],
+    *,
+    max_chars: int,
+    min_duration_ms: int,
+    max_duration_ms: int,
+    target_duration_ms: int,
+    pause_threshold_ms: int,
+    max_line_chars: int | None = None,
+    required_break_after: Sequence[int] | None = None,
+    keep_together: Sequence[Sequence[int]] | None = None,
+) -> SegmentationResult:
+    prep = prepare_segmentation(
+        words,
+        max_chars=max_chars,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+        target_duration_ms=target_duration_ms,
+        pause_threshold_ms=pause_threshold_ms,
+        max_line_chars=max_line_chars,
+        required_break_after=required_break_after,
+        keep_together=keep_together,
+    )
+    n = len(words)
+
     # ---- dynamic programming ----------------------------------------------
     INF = float("inf")
     EPS = 1e-9
@@ -372,57 +551,27 @@ def segment_words(
     nxt = [-1] * (n + 1)  # nxt[i] = inclusive end index of the segment starting at i
     # nxt_break[i] = first word of the chosen segment's second line (-1 = one line)
     nxt_break = [-1] * (n + 1)
-    target_s = target_duration_ms / 1000.0
 
     for i in range(n - 1, -1, -1):
-        chars = 0
-        for j in range(i, n):
-            chars += len(words[j].text) + (space_before[j] if j > i else 0)
-            if chars > max_chars:
-                break  # only grows as j grows
-            dur_ms = words[j].end_ms - words[i].start_ms
-            if dur_ms > max_duration_ms:
-                break  # only grows as j grows
-            # A mandatory break inside the segment is illegal, and once the
-            # span has swallowed one, every wider span starting at i does too.
-            if required_prefix[j] - required_prefix[i] > 0:
-                break
-            # The segment's end edge sits between words j and j+1; a
-            # keep-together interval forbids edges strictly inside itself.
-            if blocked_edge[j + 1]:
+        for cand in iter_candidates(prep, i):
+            if dp_cost[cand.j + 1] == INF:
                 continue
-            if max_line_chars is not None:
-                layout = _best_layout(i, j, cum_len, space_before, max_line_chars)
-                if layout is None:
-                    break  # wider spans starting at i stay unlayoutable
-                break_word, line_cost = layout
-            else:
-                break_word, line_cost = -1, 0.0
-            if dur_ms < min_duration_ms or dp_cost[j + 1] == INF:
-                continue
-            crossed = nat_prefix[j] - nat_prefix[i]
-            dur_s = dur_ms / 1000.0
-            cost = (
-                (dur_s - target_s) ** 2
-                + CROSSED_BOUNDARY_PENALTY * crossed
-                + line_cost
-                + dp_cost[j + 1]
-            )
-            count = 1 + dp_count[j + 1]
+            cost = cand.base_cost + dp_cost[cand.j + 1]
+            count = 1 + dp_count[cand.j + 1]
             if cost < dp_cost[i] - EPS or (
                 abs(cost - dp_cost[i]) <= EPS and count < dp_count[i]
             ):
                 dp_cost[i] = cost
                 dp_count[i] = count
-                nxt[i] = j
-                nxt_break[i] = break_word
+                nxt[i] = cand.j
+                nxt_break[i] = cand.break_word
 
     if dp_cost[0] == INF:
         layout_note = (
             f", max_line_chars={max_line_chars}" if max_line_chars is not None else ""
         )
         manual_note = ""
-        if required_breaks or keep_ranges:
+        if prep.has_manual_edits:
             manual_note = (
                 " and the required_break_after / keep_together boundaries"
             )
@@ -441,26 +590,16 @@ def segment_words(
     i = 0
     while i < n:
         j = nxt[i]
-        texts = [w.text for w in words[i : j + 1]]
-        bw = nxt_break[i]
-        if bw > 0:
-            text = (
-                join_word_texts(texts[: bw - i])
-                + "\n"
-                + join_word_texts(texts[bw - i :])
-            )
-        else:
-            text = join_word_texts(texts)
         segments.append(
             SegmentResult(
                 index=len(segments),
-                text=text,
+                text=build_segment_text(words, i, j, nxt_break[i]),
                 start_ms=words[i].start_ms,
                 end_ms=words[j].end_ms,
                 duration_ms=words[j].end_ms - words[i].start_ms,
                 word_start=i,
                 word_end=j,
-                crossed_boundaries=nat_prefix[j] - nat_prefix[i],
+                crossed_boundaries=prep.nat_prefix[j] - prep.nat_prefix[i],
             )
         )
         i = j + 1

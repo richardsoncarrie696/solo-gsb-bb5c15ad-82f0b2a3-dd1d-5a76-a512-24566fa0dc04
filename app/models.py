@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -119,6 +119,39 @@ class CutRequest(BaseSegmentRequest):
     )
 
 
+class Occlusion(BaseModel):
+    """A timeline interval during which one screen area is unavailable."""
+
+    start_ms: int = Field(ge=0, description="occlusion start in milliseconds")
+    end_ms: int = Field(gt=0, description="occlusion end in milliseconds")
+    region: Literal["top", "bottom"] = Field(
+        description="blocked vertical area; a subtitle with a positive-length "
+        "time intersection with the interval may not be placed there"
+    )
+
+    @model_validator(mode="after")
+    def _check_times(self) -> "Occlusion":
+        if self.end_ms <= self.start_ms:
+            raise ValueError("end_ms must be greater than start_ms")
+        return self
+
+
+class PlaceRequest(SegmentRequest):
+    occlusions: list[Occlusion] = Field(
+        min_length=1,
+        description=(
+            "timeline intervals [start_ms, end_ms) on the video timeline, in "
+            "milliseconds, during which one vertical area (region = \"top\" "
+            "or \"bottom\") is unavailable to subtitles. Intervals of the "
+            "same region must be sorted by start time and pairwise "
+            "non-overlapping (touching at an endpoint is allowed); top and "
+            "bottom intervals are independent. Every subtitle must be "
+            "placeable in one region that stays clear for its whole "
+            "duration; segmentation and placement are optimised jointly"
+        ),
+    )
+
+
 class SegmentOut(BaseModel):
     index: int
     text: str
@@ -130,7 +163,17 @@ class SegmentOut(BaseModel):
     crossed_boundaries: int
 
 
+class PlacedSegmentOut(SegmentOut):
+    position: Literal["top", "bottom"]
+
+
 class SegmentResponse(BaseModel):
     segment_count: int
     total_cost: float
     segments: list[SegmentOut]
+
+
+class PlaceResponse(BaseModel):
+    segment_count: int
+    total_cost: float
+    segments: list[PlacedSegmentOut]

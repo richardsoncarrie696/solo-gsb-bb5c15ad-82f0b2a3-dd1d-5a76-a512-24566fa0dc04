@@ -28,3 +28,7 @@ DEFAULT_PAUSE_THRESHOLD_MS = _int_env("DEFAULT_PAUSE_THRESHOLD_MS", 500)
 # Penalty added to the total cost for every sentence-ending-punctuation or
 # long-pause boundary that ends up *inside* a subtitle instead of on its edge.
 CROSSED_BOUNDARY_PENALTY = 4.0
+
+# Penalty added whenever two consecutive subtitles are placed in different
+# vertical areas (one top, one bottom).
+AREA_SWITCH_PENALTY = 1.0
